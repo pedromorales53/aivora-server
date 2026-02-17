@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
@@ -5,9 +6,9 @@ const bodyParser = require("body-parser");
 const app = express();
 app.use(bodyParser.json());
 
-const VERIFY_TOKEN = "aivora_verify_token";
-const WHATSAPP_TOKEN = "EAAXWkcxTeZBEBQqKf4DrExgrhOFlc7kiQk6wJlYxaK9AP4C2ZBE4CrnKugakZAZBUIGlC56ii9Ek3zIcc2RHzFMTiGwcq3aBq67WYMeZCOFfjued4JZCRaTbVnU3W2vKNGFGFaKuShs8ZBOeTKiw9yPYtoXZBDw4vRFe2ZBZCvoPfDpgVdk7bdTIcVZBda4nHCnGShZBNWGoNc29ZCjJ2VZAhT4DSLZBcdqqOlFUvaT1hVlMfXyasRR9ZCETZBGD5ZBBI1Haq7ACZAW2WbSQHLF5WjMmKYRiWJOBGc0KoBdWkAZD";
-const PHONE_NUMBER_ID = "102091342675354";
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 let userState = {};
 
