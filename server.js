@@ -1,177 +1,144 @@
-console.log("🧪 RAW ENV PORT:", process.env.PORT);
 require("dotenv").config();
-
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
 
-// 🔴 CRASH PROTECTION (CRITICAL)
-process.on("uncaughtException", (err) => {
-  console.error("💥 UNCAUGHT EXCEPTION:", err);
-});
+// 🔴 CRASH PROTECTION - Prevents the entire bot from dying on a single error
+process.on("uncaughtException", (err) => console.error("💥 UNCAUGHT EXCEPTION:", err));
+process.on("unhandledRejection", (err) => console.error("💥 UNHANDLED REJECTION:", err));
 
-process.on("unhandledRejection", (err) => {
-  console.error("💥 UNHANDLED REJECTION:", err);
-});
-
-// 🔴 META-SAFE BODY PARSING
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 🔴 ENV VARIABLES
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+// 🔹 ENV VARIABLES
+const { VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID } = process.env;
 
-// 🔴 DEBUG ENV (optional but helpful)
-console.log("🔑 ENV CHECK:", {
-  VERIFY_TOKEN: !!VERIFY_TOKEN,
-  WHATSAPP_TOKEN: !!WHATSAPP_TOKEN,
-  PHONE_NUMBER_ID: !!PHONE_NUMBER_ID,
-});
-
-// 🔹 IN-MEMORY USER STATE
+// 🔹 IN-MEMORY SESSION STORE
 const userState = {};
 
-// 🔹 DIAGNOSTICS
+// 🔹 DIAGNOSTIC DATABASE
 const diagnostics = {
   P0300: {
-    name: "Random Misfire",
+    name: "Random/Multiple Cylinder Misfire",
     questions: [
-      { key: "idle", question: "Engine rough at idle? (YES/NO)" },
-      { key: "accel", question: "Hesitation on acceleration? (YES/NO)" },
+      { key: "idle", question: "Is the engine rough at idle? (YES/NO)" },
+      { key: "accel", question: "Does it hesitate during acceleration? (YES/NO)" }
     ],
-    logic: (a) => {
-      if (a.idle === "YES") {
-        return { cause: "Ignition issue", action: "Check spark plugs/coils" };
-      }
-      if (a.accel === "YES") {
-        return { cause: "Fuel issue", action: "Check injectors/fuel pressure" };
-      }
-      return { cause: "General misfire", action: "Inspect engine systems" };
-    },
+    logic: (a) => a.idle === "YES" ? 
+      { cause: "Faulty spark plugs/coils", action: "Inspect plugs and test coils." } :
+      { cause: "Fuel/Air issue", action: "Check injectors and fuel pressure." }
   },
+  P0171: {
+    name: "System Too Lean (Bank 1)",
+    questions: [
+      { key: "hiss", question: "Do you hear a hissing sound? (YES/NO)" },
+      { key: "idle", question: "Does the engine idle rough? (YES/NO)" }
+    ],
+    logic: (a) => a.hiss === "YES" ? 
+      { cause: "Vacuum leak", action: "Inspect hoses and intake manifold." } :
+      { cause: "Dirty MAF sensor", action: "Clean or replace the MAF sensor." }
+  },
+  P0420: {
+    name: "Catalyst System Efficiency",
+    questions: [
+      { key: "smell", question: "Do you smell sulfur/rotten eggs? (YES/NO)" }
+    ],
+    logic: (a) => a.smell === "YES" ? 
+      { cause: "Failing catalytic converter", action: "Replace catalytic converter." } :
+      { cause: "O2 Sensor issue", action: "Check O2 sensor readings before replacing catalyst." }
+  }
+  // Add P0455, P0128 etc. here following the same structure
 };
 
 // 🔹 HEALTH CHECK
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
+app.get("/", (req, res) => res.status(200).send("Aivora Engine: Online"));
 
-// 🔹 WEBHOOK VERIFICATION (Meta)
+// 🔹 WEBHOOK VERIFICATION
 app.get("/webhook", (req, res) => {
-  console.log("🔍 VERIFY HIT");
-
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ VERIFIED");
     return res.status(200).send(challenge);
   }
-
-  console.log("❌ VERIFY FAILED");
-  return res.sendStatus(403);
+  res.sendStatus(403);
 });
 
-// 🔹 MAIN WEBHOOK (CRITICAL FIX)
+// 🔹 MAIN WEBHOOK HANDLER
 app.post("/webhook", (req, res) => {
-  console.log("🔥 WEBHOOK HIT");
-
-  // ✅ ALWAYS respond immediately (prevents 502)
+  // Always acknowledge Meta within 2 seconds
   res.status(200).send("EVENT_RECEIVED");
+  
+  const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  if (!message) return;
 
-  // ✅ Process AFTER response (non-blocking)
-  setImmediate(() => handleWebhook(req.body));
+  // Background processing to prevent 502/Timeout
+  setImmediate(() => handleInteraction(message));
 });
 
-// 🔹 CORE LOGIC
-async function handleWebhook(body) {
+async function handleInteraction(message) {
   try {
-    console.log("📦 BODY:", JSON.stringify(body));
+    let from = message.from;
+    const text = (message.text?.body || "").trim();
+    const upperText = text.toUpperCase();
 
-    const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!message) {
-      console.log("⚠️ No message in payload");
+    // 1. Check for "Fixed" intent first to break any loop
+    if (upperText.includes("FIXED")) {
+      console.log(`✅ User ${from} reported a fix.`);
+      delete userState[from]; // Wipe session
+      await safeSend(from, "That's great news! 🚗💨 I've closed this diagnostic session. Safe driving!");
       return;
     }
 
-    let from = message.from;
-    const text = (message.text?.body || "").toUpperCase().trim();
-
-    // 🔴 FIX: normalize phone number
-    if (!from.startsWith("+")) {
-      from = "+" + from;
-    }
-
-    console.log("📩 FROM:", from, "| TEXT:", text);
-
-    // 🔹 START SESSION
-    if (text.startsWith("P0")) {
-      const diag = diagnostics[text];
-
+    // 2. Start New Session (Fault Code detected)
+    if (upperText.startsWith("P0")) {
+      const diag = diagnostics[upperText];
       if (!diag) {
-        await safeSend(from, "❌ Code not supported yet.");
+        await safeSend(from, "❌ Code not yet supported. Please try P0300, P0171, or P0420.");
         return;
       }
 
-      userState[from] = {
-        code: text,
-        step: 0,
-        answers: {},
-      };
-
-      await safeSend(from, `🔍 ${text}\n${diag.questions[0].question}`);
+      userState[from] = { code: upperText, step: 0, answers: {} };
+      await safeSend(from, `🔍 ${upperText}: ${diag.name}\n\n${diag.questions[0].question}`);
       return;
     }
 
-    // 🔹 CONTINUE SESSION
+    // 3. Handle Ongoing Session
     const state = userState[from];
-
     if (state) {
       const diag = diagnostics[state.code];
-      const currentQ = diag.questions[state.step];
+      const currentQuestion = diag.questions[state.step];
 
-      if (!currentQ) {
-        delete userState[from];
-        await safeSend(from, "⚠️ Restart. Send code again.");
-        return;
-      }
-
-      state.answers[currentQ.key] = text;
+      // Save answer
+      state.answers[currentQuestion.key] = upperText;
       state.step++;
 
+      // Next Question or Result?
       if (state.step < diag.questions.length) {
         await safeSend(from, diag.questions[state.step].question);
       } else {
         const result = diag.logic(state.answers);
-
-        await safeSend(
-          from,
-          `🧠 Cause: ${result.cause}\nAction: ${result.action}`
-        );
-
-        delete userState[from];
+        await safeSend(from, `🧠 *Diagnosis:* ${result.cause}\n🛠 *Action:* ${result.action}\n\nType "Fixed" if this resolved it, or send a new code.`);
+        
+        // We keep the state for a moment so they can say "Fixed", 
+        // but it will be overwritten if they send a new P-code.
       }
-
       return;
     }
 
-    // 🔹 DEFAULT RESPONSE
-    await safeSend(from, "Send code like P0300");
+    // 4. Default Fallback
+    await safeSend(from, "Welcome to Aivora Diagnostics. 🛠\n\nPlease send a fault code (e.g., P0300) to begin.");
 
   } catch (err) {
-    console.error("❌ BACKGROUND ERROR:", err.response?.data || err.message);
+    console.error("❌ Logic Error:", err.message);
   }
 }
 
-// 🔹 SAFE SEND (NON-BLOCKING, TIMEOUT PROTECTED)
+// 🔹 BOILERPLATE SEND FUNCTION
 async function safeSend(to, message) {
   try {
-    console.log("📤 Sending to:", to);
-
     await axios.post(
       `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
       {
@@ -181,26 +148,17 @@ async function safeSend(to, message) {
         text: { body: message },
       },
       {
-        headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 5000, // prevents hanging → 502
+        headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+        timeout: 8000 
       }
     );
-
-    console.log("✅ Message sent");
   } catch (err) {
-    console.error("❌ SEND ERROR:", err.response?.data || err.message);
+    console.error("❌ Send Error:", err.response?.data || err.message);
   }
 }
 
-// 🔴 START SERVER (RAILWAY SAFE)
-const PORT = process.env.PORT || 3000;
-
-console.log("🧪 ENV PORT:", process.env.PORT);
-console.log("🧪 FINAL PORT:", PORT);
-
+// 🔹 START SERVER
+const PORT = process.env.PORT || 8080; // Defaulted to 8080 as requested
 app.listen(PORT, () => {
-  console.log(`🚀 Listening on ${PORT}`);
+  console.log(`🚀 Aivora Diagnostic Bot active on port ${PORT}`);
 });
