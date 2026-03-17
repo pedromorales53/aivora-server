@@ -1,3 +1,4 @@
+console.log("🧪 RAW ENV PORT:", process.env.PORT);
 require("dotenv").config();
 
 const express = require("express");
@@ -196,7 +197,10 @@ async function safeSend(to, message) {
 
 // 🔴 START SERVER (RAILWAY SAFE)
 const PORT = process.env.PORT;
-console.log("🌐 Binding to PORT:", PORT);
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+if (!PORT) {
+  console.error("❌ PORT is undefined — Railway not injecting it");
+  process.exit(1);
+}
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Listening on ${PORT}`);
 });
