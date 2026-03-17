@@ -195,9 +195,7 @@ async function safeSend(to, message) {
 }
 
 // 🔴 START SERVER (RAILWAY SAFE)
-const PORT = process.env.PORT;
-
-console.log("🌐 Binding to PORT:", PORT);
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
