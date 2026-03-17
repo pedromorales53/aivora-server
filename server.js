@@ -196,11 +196,11 @@ async function safeSend(to, message) {
 }
 
 // 🔴 START SERVER (RAILWAY SAFE)
-const PORT = process.env.PORT;
-if (!PORT) {
-  console.error("❌ PORT is undefined — Railway not injecting it");
-  process.exit(1);
-}
-app.listen(PORT, "0.0.0.0", () => {
+const PORT = process.env.PORT || 3000;
+
+console.log("🧪 ENV PORT:", process.env.PORT);
+console.log("🧪 FINAL PORT:", PORT);
+
+app.listen(PORT, () => {
   console.log(`🚀 Listening on ${PORT}`);
 });
