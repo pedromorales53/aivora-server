@@ -4,7 +4,10 @@ const express = require("express");
 const axios = require("axios");
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+
+// 🔴 Meta-safe parsers
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -32,38 +35,42 @@ const diagnostics = {
   }
 };
 
-// 🔹 Health
+// 🔹 HEALTH CHECK
 app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// 🔹 Verify webhook
+// 🔹 WEBHOOK VERIFICATION (Meta required)
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  console.log("🔍 VERIFY HIT");
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("✅ VERIFIED");
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+// 🔹 SINGLE WEBHOOK (FIXED)
 app.post("/webhook", (req, res) => {
   console.log("🔥 WEBHOOK HIT");
 
-  try {
-    // ALWAYS respond
-    res.status(200).send("EVENT_RECEIVED");
+  // ✅ ALWAYS respond immediately (prevents 502)
+  res.status(200).send("EVENT_RECEIVED");
 
-    // Log body AFTER responding
-    console.log("📦 BODY:", JSON.stringify(req.body));
-
-  } catch (err) {
-    console.error("❌ ERROR:", err);
-  }
-});
-
-// 🔹 MAIN WEBHOOK
-app.post("/webhook", (req, res) => {
-  res.sendStatus(200); // respond immediately
-
+  // ✅ Process AFTER response
   setImmediate(() => handleWebhook(req.body));
 });
 
-// 🔹 Core logic
+// 🔹 CORE LOGIC
 async function handleWebhook(body) {
   try {
-    console.log("🔥 Processing webhook");
+    console.log("📦 BODY:", JSON.stringify(body));
 
     const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!message) return;
@@ -71,7 +78,7 @@ async function handleWebhook(body) {
     let from = message.from;
     const text = (message.text?.body || "").toUpperCase().trim();
 
-    // 🔥 FIX: normalize number
+    // 🔥 Normalize number (CRITICAL)
     if (!from.startsWith("+")) {
       from = "+" + from;
     }
@@ -136,7 +143,7 @@ async function handleWebhook(body) {
   }
 }
 
-// 🔹 Safe send
+// 🔹 SAFE SEND
 async function safeSend(to, message) {
   try {
     console.log("📤 Sending to:", to);
@@ -164,8 +171,8 @@ async function safeSend(to, message) {
   }
 }
 
-// 🔹 Start server
-const PORT = process.env.PORT || 3000;
+// 🔹 START SERVER
+const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Running on port ${PORT}`);
