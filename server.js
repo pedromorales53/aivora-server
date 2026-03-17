@@ -170,17 +170,18 @@ app.get("/webhook", (req, res) => {
 app.post("/webhook", async (req, res) => {
   console.log("🔥 WEBHOOK HIT");
 
+  res.sendStatus(200); // respond immediately no matter what
+
   try {
-    console.log("📦 BODY:", JSON.stringify(req.body, null, 2));
-
-    res.sendStatus(200);
-
     const entry = req.body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
     const message = value?.messages?.[0];
 
-    if (!message) return;
+    if (!message) {
+      console.log("⚠️ No message");
+      return;
+    }
 
     const from = message.from;
     const text = message.text?.body?.toUpperCase().trim() || "";
