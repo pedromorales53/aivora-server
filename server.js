@@ -1,164 +1,378 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 
-// 🔴 CRASH PROTECTION - Prevents the entire bot from dying on a single error
-process.on("uncaughtException", (err) => console.error("💥 UNCAUGHT EXCEPTION:", err));
-process.on("unhandledRejection", (err) => console.error("💥 UNHANDLED REJECTION:", err));
+process.on("uncaughtException", (err) => console.error("💥 UNCAUGHT:", err));
+process.on("unhandledRejection", (err) => console.error("💥 REJECTION:", err));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 🔹 ENV VARIABLES
 const { VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID } = process.env;
 
-// 🔹 IN-MEMORY SESSION STORE
+// ─────────────────────────────────────────────────────────────
+// 📁 LEARNING LOG
+// Every resolved case appended as newline-delimited JSON.
+// This is your real-world training data for Phase 2.
+// ─────────────────────────────────────────────────────────────
+const LOG_PATH = path.join(__dirname, "resolved_cases.jsonl");
+
+function logResolvedCase(entry) {
+  const line = JSON.stringify({ ...entry, ts: new Date().toISOString() });
+  fs.appendFileSync(LOG_PATH, line + "\n");
+}
+
+// ─────────────────────────────────────────────────────────────
+// 🗃️ SESSION STORE
+// In-memory for V1. Swap for Redis in Phase 2.
+// ─────────────────────────────────────────────────────────────
 const userState = {};
 
-// 🔹 DIAGNOSTIC DATABASE
+// ─────────────────────────────────────────────────────────────
+// 🔧 DIAGNOSTIC DATABASE
+// logic(answers, vehicle) → { cause, action }
+// Vehicle context is used NOW — not deferred.
+// ─────────────────────────────────────────────────────────────
 const diagnostics = {
   P0300: {
-    name: "Random/Multiple Cylinder Misfire",
+    name: "Falla aleatoria en múltiples cilindros",
     questions: [
-      { key: "idle", question: "Is the engine rough at idle? (YES/NO)" },
-      { key: "accel", question: "Does it hesitate during acceleration? (YES/NO)" }
+      { key: "idle", ask: "1️⃣ ¿El motor vibra o falla en *ralentí/mínimo*? (SI / NO)" },
+      { key: "accel", ask: "2️⃣ ¿Siente *jalones o titubeo* al acelerar? (SI / NO)" },
+      { key: "plugs", ask: "3️⃣ ¿Cuándo fue el último cambio de *bujías*?\n A) Reciente B) Más de 1 año C) No sé" }
     ],
-    logic: (a) => a.idle === "YES" ? 
-      { cause: "Faulty spark plugs/coils", action: "Inspect plugs and test coils." } :
-      { cause: "Fuel/Air issue", action: "Check injectors and fuel pressure." }
+    logic: (a, v) => {
+      const km = parseInt(v.mileage) || 0;
+      const old = km > 80000;
+      if (a.idle === "SI" && a.plugs !== "A")
+        return { cause: "Bujías o bobinas defectuosas", action: `Con ${km.toLocaleString()} km en un ${v.year} ${v.make} ${v.model}, revisar bujías y probar bobinas de encendido individualmente.` };
+      if (a.accel === "SI")
+        return { cause: "Problema de combustible o inyectores", action: "Verificar presión de combustible y flujo de inyectores. Considerar limpieza en ultrasonido." };
+      if (old)
+        return { cause: "Desgaste acumulado por alto kilometraje", action: `A ${km.toLocaleString()} km conviene hacer prueba de compresión y revisar estado de anillos.` };
+      return { cause: "Falla intermitente — requiere escaneo en tiempo real", action: "Revisar datos de RPM, TPS y MAF con escáner mientras el fallo ocurre." };
+    }
   },
+
   P0171: {
-    name: "System Too Lean (Bank 1)",
+    name: "Mezcla pobre — Banco 1",
     questions: [
-      { key: "hiss", question: "Do you hear a hissing sound? (YES/NO)" },
-      { key: "idle", question: "Does the engine idle rough? (YES/NO)" }
+      { key: "hiss", ask: "1️⃣ ¿Escucha algún *silbido* cerca del motor encendido? (SI / NO)" },
+      { key: "idle", ask: "2️⃣ ¿El motor *falla en mínimo* o se apaga solo? (SI / NO)" },
+      { key: "maf", ask: "3️⃣ ¿El sensor MAF ha sido limpiado o cambiado?\n A) Sí, recientemente B) No C) No sé" }
     ],
-    logic: (a) => a.hiss === "YES" ? 
-      { cause: "Vacuum leak", action: "Inspect hoses and intake manifold." } :
-      { cause: "Dirty MAF sensor", action: "Clean or replace the MAF sensor." }
+    logic: (a, v) => {
+      if (a.hiss === "SI")
+        return { cause: "Fuga de vacío", action: `Inspeccionar mangueras y múltiple de admisión del ${v.make} ${v.model}. Las fugas de vacío son frecuentes con el calor de CDMX.` };
+      if (a.maf === "B" || a.maf === "C")
+        return { cause: "Sensor MAF sucio o degradado", action: "Limpiar con spray para MAF. Si persiste, comparar lectura g/s vs especificación de fábrica." };
+      return { cause: "Inyector sucio o baja presión de combustible", action: "Medir presión de combustible en riel. Si es correcta, limpiar inyectores con servicio ultrasónico." };
+    }
   },
+
   P0420: {
-    name: "Catalyst System Efficiency",
+    name: "Eficiencia baja del catalizador — Banco 1",
     questions: [
-      { key: "smell", question: "Do you smell sulfur/rotten eggs? (YES/NO)" }
+      { key: "smell", ask: "1️⃣ ¿Detecta *olor a huevo podrido* en el escape? (SI / NO)" },
+      { key: "power", ask: "2️⃣ ¿Nota *pérdida de potencia* o aceleración lenta? (SI / NO)" }
     ],
-    logic: (a) => a.smell === "YES" ? 
-      { cause: "Failing catalytic converter", action: "Replace catalytic converter." } :
-      { cause: "O2 Sensor issue", action: "Check O2 sensor readings before replacing catalyst." }
+    logic: (a, v) => {
+      const age = new Date().getFullYear() - (parseInt(v.year) || 2010);
+      if (a.smell === "SI" && age > 8)
+        return { cause: "Catalizador deteriorado por antigüedad", action: `Con ${age} años de uso, el catalizador del ${v.make} ${v.model} probablemente necesita reemplazo. Cotizar antes de cambiar sensores O2.` };
+      if (a.smell === "NO")
+        return { cause: "Sensor O2 trasero dando falsos positivos", action: "Verificar voltaje del O2 trasero con osciloscopio antes de reemplazar catalizador." };
+      return { cause: "Catalizador contaminado por mezcla rica prolongada", action: "Inspeccionar visualmente. Verificar si hubo fallas de inyectores previas que lo saturaron." };
+    }
+  },
+
+  P0455: {
+    name: "Fuga grande en sistema EVAP",
+    questions: [
+      { key: "cap", ask: "1️⃣ ¿Revisó que la *tapa del tanque* esté bien cerrada? (SI / NO)" },
+      { key: "smell", ask: "2️⃣ ¿Huele *gasolina* cerca del vehículo estacionado? (SI / NO)" }
+    ],
+    logic: (a) => {
+      if (a.cap === "NO")
+        return { cause: "Tapa de tanque floja o dañada", action: "Apretar o reemplazar tapa. Limpiar código y monitorear — es la causa #1 del P0455." };
+      if (a.smell === "SI")
+        return { cause: "Fuga física en líneas EVAP", action: "Realizar prueba de humo en sistema EVAP para localizar fuga. Revisar purge valve y mangueras." };
+      return { cause: "Válvula de purga o sensor de presión EVAP defectuoso", action: "Probar válvula de purga con multímetro (12V al activar). Verificar sensor de presión del tanque." };
+    }
+  },
+
+  P0128: {
+    name: "Temperatura del motor bajo umbral del termostato",
+    questions: [
+      { key: "warmup", ask: "1️⃣ ¿El motor *tarda mucho en llegar a temperatura normal*? (SI / NO)" },
+      { key: "heat", ask: "2️⃣ ¿La *calefacción* del habitáculo funciona bien? (SI / NO)" }
+    ],
+    logic: (a, v) => {
+      if (a.warmup === "SI" && a.heat === "NO")
+        return { cause: "Termostato atascado en posición abierta", action: `Reemplazar termostato del ${v.make} ${v.model} — es la reparación más probable y accesible para este código.` };
+      if (a.warmup === "SI" && a.heat === "SI")
+        return { cause: "Sensor ECT (temperatura) descalibrado", action: "Comparar lectura real vs escáner con termómetro infrarrojo. El sensor puede estar reportando bajo." };
+      return { cause: "Falla intermitente del termostato", action: "Monitorear temperatura en tiempo real durante recorrido completo. Puede fallar solo bajo cierta carga." };
+    }
   }
-  // Add P0455, P0128 etc. here following the same structure
 };
 
+// ─────────────────────────────────────────────────────────────
+// 🔹 INPUT PARSERS
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Pipe format: Make | Model | Year | Code | Mileage
+ * Returns { vehicle, code } or null
+ */
+function parsePipeInput(text) {
+  if (!text.includes("|")) return null;
+  const parts = text.split("|").map(x => x.trim());
+  if (parts.length < 4) return null;
+
+  const [make, model, year, rawCode, mileage = "0"] = parts;
+  const code = rawCode.toUpperCase().match(/P[0-9]{4}/)?.[0];
+  if (!code) return null;
+
+  return {
+    vehicle: { make, model, year, mileage: mileage.replace(/[^0-9]/g, "") },
+    code
+  };
+}
+
+/** Extract standalone fault code from text */
+function extractCode(text) {
+  return text.toUpperCase().match(/P[0-9]{4}/)?.[0] || null;
+}
+
+// ─────────────────────────────────────────────────────────────
 // 🔹 HEALTH CHECK
-app.get("/", (req, res) => res.status(200).send("Aivora Engine: Online"));
+// ─────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.status(200).send("Aivora Engine: Online ✅"));
 
+// ─────────────────────────────────────────────────────────────
 // 🔹 WEBHOOK VERIFICATION
+// ─────────────────────────────────────────────────────────────
 app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  const { "hub.mode": mode, "hub.verify_token": token, "hub.challenge": challenge } = req.query;
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   res.sendStatus(403);
 });
 
-// 🔹 MAIN WEBHOOK HANDLER
+// ─────────────────────────────────────────────────────────────
+// 🔹 WEBHOOK RECEIVER
+// ─────────────────────────────────────────────────────────────
 app.post("/webhook", (req, res) => {
-  // Always acknowledge Meta within 2 seconds
   res.status(200).send("EVENT_RECEIVED");
-  
   const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
   if (!message) return;
-
-  // Background processing to prevent 502/Timeout
   setImmediate(() => handleInteraction(message));
 });
 
+// ─────────────────────────────────────────────────────────────
+// 🔹 MAIN INTERACTION ENGINE
+// ─────────────────────────────────────────────────────────────
 async function handleInteraction(message) {
   try {
-    let from = message.from;
+    const from = message.from;
     const text = (message.text?.body || "").trim();
-    const upperText = text.toUpperCase();
+    const upper = text.toUpperCase();
+    const state = userState[from] || {};
 
-    // 1. Check for "Fixed" intent first to break any loop
-    if (upperText.includes("FIXED")) {
-      console.log(`✅ User ${from} reported a fix.`);
-      delete userState[from]; // Wipe session
-      await safeSend(from, "That's great news! 🚗💨 I've closed this diagnostic session. Safe driving!");
-      return;
+    // ── GLOBAL: RESET ────────────────────────────────────────
+    if (["RESET", "REINICIAR", "NUEVO"].some(c => upper.includes(c))) {
+      delete userState[from];
+      return safeSend(from,
+        `🔄 Sesión reiniciada.\n\n` +
+        `Envíame el diagnóstico en este formato:\n\n` +
+        `*Marca | Modelo | Año | Código | Kilometraje*\n` +
+        `_Ej: Chevrolet | Aveo | 2015 | P0300 | 120000_\n\n` +
+        `O solo el código si no tienes datos del vehículo:\n_Ej: P0300_`
+      );
     }
 
-    // 2. Start New Session (Fault Code detected)
-    if (upperText.startsWith("P0")) {
-      const diag = diagnostics[upperText];
-      if (!diag) {
-        await safeSend(from, "❌ Code not yet supported. Please try P0300, P0171, or P0420.");
-        return;
-      }
-
-      userState[from] = { code: upperText, step: 0, answers: {} };
-      await safeSend(from, `🔍 ${upperText}: ${diag.name}\n\n${diag.questions[0].question}`);
-      return;
+    // ── STAGE: Awaiting FIXED / NOT FIXED ────────────────────
+    if (state.stage === "awaiting_feedback") {
+      return handleFeedback(from, upper, state);
     }
 
-    // 3. Handle Ongoing Session
-    const state = userState[from];
-    if (state) {
-      const diag = diagnostics[state.code];
-      const currentQuestion = diag.questions[state.step];
-
-      // Save answer
-      state.answers[currentQuestion.key] = upperText;
-      state.step++;
-
-      // Next Question or Result?
-      if (state.step < diag.questions.length) {
-        await safeSend(from, diag.questions[state.step].question);
-      } else {
-        const result = diag.logic(state.answers);
-        await safeSend(from, `🧠 *Diagnosis:* ${result.cause}\n🛠 *Action:* ${result.action}\n\nType "Fixed" if this resolved it, or send a new code.`);
-        
-        // We keep the state for a moment so they can say "Fixed", 
-        // but it will be overwritten if they send a new P-code.
-      }
-      return;
+    // ── STAGE: Awaiting actual fix description ────────────────
+    if (state.stage === "awaiting_fix_description") {
+      return handleFixDescription(from, text, state);
     }
 
-    // 4. Default Fallback
-    await safeSend(from, "Welcome to Aivora Diagnostics. 🛠\n\nPlease send a fault code (e.g., P0300) to begin.");
+    // ── STAGE: Q&A in progress ────────────────────────────────
+    if (state.stage === "questioning") {
+      return handleAnswer(from, upper, state);
+    }
+
+    // ── NEW INPUT: pipe format ────────────────────────────────
+    const parsed = parsePipeInput(text);
+    if (parsed) {
+      return startDiagnostic(from, parsed.code, parsed.vehicle);
+    }
+
+    // ── NEW INPUT: code only ──────────────────────────────────
+    const code = extractCode(text);
+    if (code) {
+      const vehicle = state.vehicle || { make: "", model: "", year: "", mileage: "0" };
+      return startDiagnostic(from, code, vehicle);
+    }
+
+    // ── FALLBACK ──────────────────────────────────────────────
+    return safeSend(from,
+      `👋 Bienvenido a *Aivora Diagnostics* 🔧\n\n` +
+      `Envíame el diagnóstico así:\n\n` +
+      `*Marca | Modelo | Año | Código | Kilometraje*\n` +
+      `_Ej: Nissan | Sentra | 2016 | P0171 | 95000_\n\n` +
+      `O solo el código de falla:\n` +
+      `_Ej: P0171_`
+    );
 
   } catch (err) {
-    console.error("❌ Logic Error:", err.message);
+    console.error("❌ Error:", err.message);
   }
 }
 
-// 🔹 BOILERPLATE SEND FUNCTION
-async function safeSend(to, message) {
+// ─────────────────────────────────────────────────────────────
+// 🔹 START DIAGNOSTIC
+// ─────────────────────────────────────────────────────────────
+async function startDiagnostic(from, code, vehicle) {
+  const diag = diagnostics[code];
+
+  if (!diag) {
+    return safeSend(from,
+      `⚠️ Código *${code}* no está en mi base aún.\n\n` +
+      `Códigos disponibles: P0300, P0171, P0420, P0455, P0128\n\n` +
+      `Estamos expandiendo continuamente. ¡Gracias!`
+    );
+  }
+
+  userState[from] = { stage: "questioning", code, vehicle, step: 0, answers: {} };
+
+  const hasVehicle = vehicle.make && vehicle.make.length > 0;
+  const label = hasVehicle
+    ? `🚗 ${vehicle.year} ${vehicle.make} ${vehicle.model}${vehicle.mileage > 0 ? ` · ${Number(vehicle.mileage).toLocaleString()} km` : ""}\n`
+    : "";
+
+  return safeSend(from,
+    `🔍 *${code} — ${diag.name}*\n` +
+    label +
+    `\nVamos a identificar la causa 👇\n\n` +
+    diag.questions[0].ask
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 🔹 HANDLE Q&A ANSWERS
+// ─────────────────────────────────────────────────────────────
+async function handleAnswer(from, upper, state) {
+  const diag = diagnostics[state.code];
+  const current = diag.questions[state.step];
+
+  state.answers[current.key] = upper;
+  state.step++;
+
+  if (state.step < diag.questions.length) {
+    return safeSend(from, diag.questions[state.step].ask);
+  }
+
+  // All answered → run logic engine
+  const result = diag.logic(state.answers, state.vehicle);
+  const v = state.vehicle;
+  const hasV = v.make && v.make.length > 0;
+
+  state.lastResult = result;
+  state.stage = "awaiting_feedback";
+
+  return safeSend(from,
+    `🧠 *Diagnóstico Aivora*\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    (hasV ? `🚗 ${v.year} ${v.make} ${v.model} · ${Number(v.mileage).toLocaleString()} km\n` : "") +
+    `🔎 ${state.code}\n\n` +
+    `*Causa probable:*\n${result.cause}\n\n` +
+    `*Acción recomendada:*\n${result.action}\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `¿Esto resolvió el problema?\n\n` +
+    `✅ *FIXED* — Sí, resuelto\n` +
+    `❌ *NO* — Sigue fallando`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 🔹 HANDLE FEEDBACK
+// ─────────────────────────────────────────────────────────────
+async function handleFeedback(from, upper, state) {
+  const resolved = upper.includes("FIXED") || upper.includes("LISTO") || upper.includes("SI");
+
+  if (resolved) {
+    state.stage = "awaiting_fix_description";
+    return safeSend(from,
+      `✅ *¡Excelente trabajo!* 🚗💨\n\n` +
+      `Una última cosa — ¿cuál fue la reparación final?\n` +
+      `_(Ej: "Cambié las bujías y la bobina del cilindro 3")_\n\n` +
+      `Esto mejora Aivora para todos los técnicos. 🙏`
+    );
+  }
+
+  // NOT FIXED → escalate gracefully
+  state.stage = "escalated";
+  return safeSend(from,
+    `⚠️ *Diagnóstico no resuelto — Profundizando*\n\n` +
+    `El código *${state.code}* puede tener una causa más profunda.\n\n` +
+    `Pasos adicionales recomendados:\n` +
+    `• Escanear datos en tiempo real: RPM, TPS, MAF, O2\n` +
+    `• Verificar tierra del motor y voltaje de batería en ralentí\n` +
+    `• Revisar actualizaciones de calibración (TSB) para este modelo\n` +
+    `• Si persiste, considerar inspección física especializada\n\n` +
+    `Envía un nuevo código o escribe *RESET* para nuevo vehículo.`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 🔹 HANDLE FIX DESCRIPTION — THE LEARNING LOOP 🎯
+// Real-world repair outcomes = your Phase 2 training data
+// ─────────────────────────────────────────────────────────────
+async function handleFixDescription(from, text, state) {
+  logResolvedCase({
+    phone: from,
+    vehicle: state.vehicle,
+    code: state.code,
+    answers: state.answers,
+    aivora_diagnosis: state.lastResult,
+    actual_fix: text // ← the gold
+  });
+
+  delete userState[from];
+
+  return safeSend(from,
+    `✅ *¡Registrado, gracias!*\n\n` +
+    `Cada caso confirmado hace a Aivora más preciso para todos los talleres. 🧠\n\n` +
+    `Envía un nuevo código cuando lo necesites. ¡Éxito! 🔧`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 🔹 SEND HELPER
+// ─────────────────────────────────────────────────────────────
+async function safeSend(to, body) {
   try {
     await axios.post(
       `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to,
-        type: "text",
-        text: { body: message },
-      },
-      {
-        headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-        timeout: 8000 
-      }
+      { messaging_product: "whatsapp", to, type: "text", text: { body } },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }, timeout: 8000 }
     );
   } catch (err) {
     console.error("❌ Send Error:", err.response?.data || err.message);
   }
 }
 
-// 🔹 START SERVER
-const PORT = process.env.PORT || 8080; // Defaulted to 8080 as requested
-app.listen(PORT, () => {
-  console.log(`🚀 Aivora Diagnostic Bot active on port ${PORT}`);
-});
+// ─────────────────────────────────────────────────────────────
+// 🔹 START
+// ─────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`🚀 Aivora V1 active on port ${PORT}`));
