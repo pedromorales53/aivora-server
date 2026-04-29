@@ -534,7 +534,7 @@ async function handleFixDescription(from, text, state) {
 async function safeSend(to, body) {
   try {
     await axios.post(
-      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v24.0/${PHONE_NUMBER_ID}/messages`,
       { messaging_product: "whatsapp", to, type: "text", text: { body } },
       { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }, timeout: 8000 }
     );
