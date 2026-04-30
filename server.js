@@ -338,7 +338,9 @@ app.get("/webhook", (req, res) => {
 // ─────────────────────────────────────────────────────────────
 app.post("/webhook", (req, res) => {
   res.status(200).send("EVENT_RECEIVED");
+  console.log("📨 Webhook received:", JSON.stringify(req.body));
   const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  console.log("📩 Message extracted:", JSON.stringify(message));
   if (!message) return;
   setImmediate(() => handleInteraction(message));
 });
