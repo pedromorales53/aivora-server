@@ -532,6 +532,10 @@ async function handleFixDescription(from, text, state) {
 // 🔹 SEND HELPER
 // ─────────────────────────────────────────────────────────────
 async function safeSend(to, body) {
+  // Normalize Mexican numbers: 52XXXXXXXXXX → 521XXXXXXXXXX
+  if (to.startsWith("52") && to.length === 12) {
+    to = "521" + to.slice(2);
+  }
   try {
     await axios.post(
       `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
