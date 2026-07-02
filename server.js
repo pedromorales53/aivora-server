@@ -15,15 +15,23 @@ app.use(express.urlencoded({ extended: true }));
 const { VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID } = process.env;
 
 // ─────────────────────────────────────────────────────────────
-// 📁 PERSISTENT LOGS
-// NOTE: Railway's filesystem is EPHEMERAL — these reset on every
-// redeploy. They're still far better than Railway's rotating logs
-// for within-deploy visibility. Permanent storage = Phase 2 (DB).
+// 📁 DATA DIR — PERSISTENCIA
+// Si existe la variable DATA_DIR (ej. /data con un Volume de
+// Railway montado ahí), los logs sobreviven redeploys/restarts.
+// Sin la variable, cae al comportamiento anterior (efímero).
 // ─────────────────────────────────────────────────────────────
-const LOG_PATH          = path.join(__dirname, "resolved_cases.jsonl");  // completed diagnoses + real fix
-const MISS_PATH         = path.join(__dirname, "missed_codes.jsonl");    // codes users asked for that we lack
-const INTERACTIONS_PATH = path.join(__dirname, "interactions.jsonl");    // every inbound message
-const SYMPTOM_PATH      = path.join(__dirname, "symptom_backlog.jsonl"); // symptom messages w/ no code
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { console.error("mkdir DATA_DIR:", e.message); }
+const IS_PERSISTENT = DATA_DIR !== __dirname;
+
+const LOG_PATH          = path.join(DATA_DIR, "resolved_cases.jsonl");  // diagnósticos completados + fix real
+const MISS_PATH         = path.join(DATA_DIR, "missed_codes.jsonl");    // códigos que pidieron y no tenemos
+const INTERACTIONS_PATH = path.join(DATA_DIR, "interactions.jsonl");    // cada mensaje entrante
+const SYMPTOM_PATH      = path.join(DATA_DIR, "symptom_backlog.jsonl"); // síntomas sin código
+const EVENTS_PATH       = path.join(DATA_DIR, "events.jsonl");          // funnel: diag_start, diag_result, offer_shown...
+const INTEREST_PATH     = path.join(DATA_DIR, "pack_interest.jsonl");   // 🎯 leads del smoke test de monetización
+
+const SERVER_STARTED = new Date().toISOString();
 
 function appendLine(p, obj) {
   try { fs.appendFileSync(p, JSON.stringify({ ...obj, ts: new Date().toISOString() }) + "\n"); }
@@ -33,11 +41,41 @@ const logResolvedCase = (entry)            => appendLine(LOG_PATH, entry);
 const logMissedCode   = (from, code, raw)  => appendLine(MISS_PATH, { from, code, rawText: raw });
 const logInteraction  = (from, text)       => appendLine(INTERACTIONS_PATH, { from, text });
 const logSymptom      = (from, tag, raw)   => appendLine(SYMPTOM_PATH, { from, tag, rawText: raw });
+const logEvent        = (from, event, meta = {}) => appendLine(EVENTS_PATH, { from, event, ...meta });
+const logInterest     = (from, level, raw) => appendLine(INTEREST_PATH, { from, level, rawText: raw });
 
 // ─────────────────────────────────────────────────────────────
-// 🗃️ SESSION STORE (in-memory for V1; Redis is Phase 2)
+// 💰 SMOKE TEST DE MONETIZACIÓN — "AIVORA PRO" (pack prepagado)
+// NO hay paywall: Aivora sigue gratis. Esto SOLO mide señal de
+// disposición a pagar. Pedro cierra los leads manualmente.
+// Edita precio/copy aquí; OFFER_ENABLED=false lo apaga sin deploy
+// de código (via variable de entorno en Railway).
+// ─────────────────────────────────────────────────────────────
+const OFFER_ENABLED = (process.env.OFFER_ENABLED || "true").toLowerCase() !== "false";
+const OFFER_PRICE   = process.env.OFFER_PRICE || "$99 MXN";
+
+const OFFER_FOOTER = `\n\n💡 ¿Quieres diagnósticos *prioritarios* con seguimiento personal? Manda *INFO*`;
+
+const OFFER_FULL =
+  `🚀 *Aivora Pro* — lanzamiento\n\n` +
+  `Estamos armando el primer paquete de pago:\n\n` +
+  `🔧 10 diagnósticos prioritarios\n` +
+  `📸 Puedes mandar fotos y audios del problema\n` +
+  `👨‍🔧 Seguimiento personal hasta que quede resuelto\n` +
+  `💰 ${OFFER_PRICE} (precio de lanzamiento — primeros 20 lugares)\n\n` +
+  `Aivora normal sigue *gratis*, esto es para quien quiere ir más a fondo.\n\n` +
+  `¿Te apartamos un lugar? Responde *ME INTERESA* 👇`;
+
+const OFFER_CONFIRMED =
+  `🙌 *¡Listo, quedaste apuntado!*\n\n` +
+  `Pedro (el creador de Aivora) te escribe personalmente por aquí para apartarte tu lugar y ver la forma de pago.\n\n` +
+  `Mientras tanto puedes seguir usando Aivora gratis como siempre. 🔧`;
+
+// ─────────────────────────────────────────────────────────────
+// 🗃️ SESSION STORE (in-memory para V1; Redis es Phase 2)
 // ─────────────────────────────────────────────────────────────
 const userState = {};
+const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6h: sesión abandonada → empezar de cero
 
 // ─────────────────────────────────────────────────────────────
 // 🔧 DIAGNOSTIC DATABASE
@@ -437,9 +475,6 @@ const AVAILABLE_CODES = Object.keys(diagnostics);
 
 // ─────────────────────────────────────────────────────────────
 // 🔹 SYMPTOM HINTS (LIGHTWEIGHT — no es motor de diagnóstico)
-// Para cuando alguien describe un síntoma SIN código. Da un
-// empujón útil, lo registra para el backlog, y lo manda a escanear.
-// NO reemplaza el diagnóstico por código. Phase 2 = árbol completo.
 // ─────────────────────────────────────────────────────────────
 const SYMPTOM_HINTS = [
   { tag: "rpm_cap", kw: ["no pasa de 2000", "no pasa de las 2000", "no revoluciona", "se queda en 2000", "no sube de rpm"],
@@ -478,7 +513,8 @@ const KNOWN_MAKES = {
 const KNOWN_MODELS = {
   VERSA: "Versa", TSURU: "Tsuru", SENTRA: "Sentra", MARCH: "March",
   AVEO: "Aveo", JETTA: "Jetta", TIIDA: "Tiida", TIDA: "Tiida",
-  NP300: "NP300", SPARK: "Spark", GOL: "Gol", VENTO: "Vento", FIGO: "Figo"
+  NP300: "NP300", SPARK: "Spark", GOL: "Gol", VENTO: "Vento", FIGO: "Figo",
+  FRONTIER: "Frontier", KICKS: "Kicks", ALTIMA: "Altima", XTRAIL: "X-Trail"
 };
 
 function parseInput(text) {
@@ -525,39 +561,119 @@ function normalizeAnswer(text) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 🔹 HEALTH CHECK + STATS
+// 🔹 HELPERS DE LECTURA (para /stats y /logs)
+// ─────────────────────────────────────────────────────────────
+function readJsonl(p) {
+  try {
+    return fs.readFileSync(p, "utf8").trim().split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+  } catch { return []; }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 🔹 HEALTH CHECK + STATS + LOGS
 // ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.status(200).send("Aivora Engine: Online ✅"));
 
-// /stats?token=VERIFY_TOKEN → numbers sin depender de Railway logs
+// /stats?token=VERIFY_TOKEN → tablero de decisión completo
 app.get("/stats", (req, res) => {
   if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
 
-  const readLines = (p) => {
-    try { return fs.readFileSync(p, "utf8").trim().split("\n").filter(Boolean); }
-    catch { return []; }
-  };
-  const interactions = readLines(INTERACTIONS_PATH).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const interactions = readJsonl(INTERACTIONS_PATH);
+  const events       = readJsonl(EVENTS_PATH);
+  const resolved     = readJsonl(LOG_PATH);
+  const missed       = readJsonl(MISS_PATH);
+  const symptoms     = readJsonl(SYMPTOM_PATH);
+  const interest     = readJsonl(INTEREST_PATH);
 
-  const users = new Set(interactions.map(i => i.from));
-  // usuarios que regresaron: aparecen en 2+ días distintos (la métrica clave)
+  // Usuarios únicos y returning (2+ días distintos) — LA métrica del sprint
   const byUser = {};
   interactions.forEach(i => {
     const day = (i.ts || "").slice(0, 10);
     (byUser[i.from] = byUser[i.from] || new Set()).add(day);
   });
+  const uniqueUsers = Object.keys(byUser).length;
   const returning = Object.values(byUser).filter(days => days.size >= 2).length;
 
-  res.json({
-    total_messages: interactions.length,
-    unique_users: users.size,
-    returning_users: returning,
-    completed_diagnoses: readLines(LOG_PATH).length,
-    missed_codes: readLines(MISS_PATH).length,
-    symptom_messages: readLines(SYMPTOM_PATH).length,
-    codes_live: AVAILABLE_CODES.length,
-    note: "Railway FS es efímero: estos números se reinician al hacer redeploy."
+  // Actividad por día (para ver tendencia, no solo acumulado)
+  const daily = {};
+  interactions.forEach(i => {
+    const day = (i.ts || "").slice(0, 10);
+    daily[day] = (daily[day] || 0) + 1;
   });
+
+  // Funnel: iniciados → resultado entregado → fix confirmado
+  const starts  = events.filter(e => e.event === "diag_start");
+  const results = events.filter(e => e.event === "diag_result");
+
+  // Top códigos pedidos (de los que sí tenemos)
+  const codeCounts = {};
+  starts.forEach(e => { if (e.code) codeCounts[e.code] = (codeCounts[e.code] || 0) + 1; });
+
+  // Top códigos que NO tenemos (backlog data-driven)
+  const missedCounts = {};
+  missed.forEach(m => { if (m.code) missedCounts[m.code] = (missedCounts[m.code] || 0) + 1; });
+
+  res.json({
+    window: {
+      server_started: SERVER_STARTED,
+      first_interaction: interactions[0]?.ts || null,
+      last_interaction: interactions[interactions.length - 1]?.ts || null
+    },
+    persistence: {
+      persistent: IS_PERSISTENT,
+      data_dir: DATA_DIR,
+      note: IS_PERSISTENT
+        ? "✅ Volumen persistente activo: los datos sobreviven redeploys."
+        : "⚠️ FS efímero: configura un Volume en Railway + variable DATA_DIR."
+    },
+    usage: {
+      total_messages: interactions.length,
+      unique_users: uniqueUsers,
+      returning_users: returning,
+      daily_messages: daily
+    },
+    funnel: {
+      diagnostics_started: starts.length,
+      results_delivered: results.length,
+      fixes_confirmed: resolved.length,
+      drop_before_result: Math.max(starts.length - results.length, 0)
+    },
+    demand: {
+      top_codes_requested: codeCounts,
+      missed_codes_total: missed.length,
+      top_missed_codes: missedCounts,
+      symptom_messages: symptoms.length
+    },
+    monetization: {
+      offer_enabled: OFFER_ENABLED,
+      offer_price: OFFER_PRICE,
+      offers_shown: events.filter(e => e.event === "offer_shown").length,
+      info_requests: interest.filter(i => i.level === "info").length,
+      hot_leads: interest.filter(i => i.level === "hot").length
+    },
+    codes_live: AVAILABLE_CODES.length
+  });
+});
+
+// /logs?token=...&file=missed|symptoms|resolved|interactions|events|interest&limit=100
+// → lee los .jsonl directo desde el navegador, sin entrar a Railway
+const LOG_FILES = {
+  missed: MISS_PATH,
+  symptoms: SYMPTOM_PATH,
+  resolved: LOG_PATH,
+  interactions: INTERACTIONS_PATH,
+  events: EVENTS_PATH,
+  interest: INTEREST_PATH
+};
+app.get("/logs", (req, res) => {
+  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  const file = LOG_FILES[req.query.file];
+  if (!file) return res.status(400).json({ error: "file debe ser: " + Object.keys(LOG_FILES).join(", ") });
+  const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
+  const lines = readJsonl(file);
+  res.json({ file: req.query.file, total: lines.length, showing: Math.min(limit, lines.length), entries: lines.slice(-limit) });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -587,20 +703,37 @@ async function handleInteraction(message) {
     const from = message.from;
     const text = (message.text?.body || "").trim();
     const upper = text.toUpperCase();
-    const state = userState[from] || {};
 
-    logInteraction(from, text); // 👈 registro persistente de cada mensaje
+    logInteraction(from, text);
+
+    // Sesión abandonada hace 6+ horas → empezar limpio (conserva el vehículo)
+    let state = userState[from] || {};
+    if (state.lastTs && Date.now() - state.lastTs > SESSION_TTL_MS) {
+      state = { vehicle: state.vehicle };
+      userState[from] = state;
+    }
+    state.lastTs = Date.now();
+    userState[from] = state;
 
     if (["RESET", "REINICIAR", "NUEVO", "MENU"].some(c => upper.includes(c))) {
       delete userState[from];
       return safeSend(from, welcomeMessage());
     }
 
-    if (state.stage === "awaiting_feedback") return handleFeedback(from, upper, state);
-    if (state.stage === "awaiting_fix_description") return handleFixDescription(from, text, state);
-    if (state.stage === "questioning") return handleAnswer(from, upper, state);
+    // 💰 Smoke test: leads siempre alcanzables, en cualquier punto del flujo
+    if (OFFER_ENABLED && upper.includes("ME INTERESA")) {
+      logInterest(from, "hot", text);
+      logEvent(from, "hot_lead");
+      return safeSend(from, OFFER_CONFIRMED);
+    }
+    if (OFFER_ENABLED && upper === "INFO") {
+      logInterest(from, "info", text);
+      logEvent(from, "offer_shown", { variant: "full" });
+      return safeSend(from, OFFER_FULL);
+    }
 
-    // 1) ¿Trae código?
+    // Un código nuevo SIEMPRE arranca diagnóstico nuevo, aunque estuviera
+    // a medio flujo (antes se quedaban atorados si abandonaban preguntas)
     const parsed = parseInput(text);
     if (parsed) {
       const hasNewVehicle = parsed.vehicle.make || parsed.vehicle.model || parsed.vehicle.year;
@@ -608,7 +741,11 @@ async function handleInteraction(message) {
       return startDiagnostic(from, parsed.code, vehicle, text);
     }
 
-    // 2) ¿Describe un síntoma conocido sin código?
+    if (state.stage === "awaiting_feedback") return handleFeedback(from, upper, state);
+    if (state.stage === "awaiting_fix_description") return handleFixDescription(from, text, state);
+    if (state.stage === "questioning") return handleAnswer(from, upper, state);
+
+    // ¿Describe un síntoma conocido sin código?
     const symptom = detectSymptom(text);
     if (symptom) {
       logSymptom(from, symptom.tag, text);
@@ -619,7 +756,7 @@ async function handleInteraction(message) {
       );
     }
 
-    // 3) Nada reconocible → bienvenida
+    // Nada reconocible → bienvenida
     return safeSend(from, welcomeMessage());
 
   } catch (err) {
@@ -654,7 +791,8 @@ async function startDiagnostic(from, code, vehicle, rawText) {
     );
   }
 
-  userState[from] = { stage: "questioning", code, vehicle, step: 0, answers: {} };
+  userState[from] = { stage: "questioning", code, vehicle, step: 0, answers: {}, lastTs: Date.now() };
+  logEvent(from, "diag_start", { code });
 
   const hasVehicle = vehicle.make && vehicle.make.length > 0;
   const label = hasVehicle
@@ -689,6 +827,8 @@ async function handleAnswer(from, upper, state) {
 
   state.lastResult = result;
   state.stage = "awaiting_feedback";
+  logEvent(from, "diag_result", { code: state.code });
+  if (OFFER_ENABLED) logEvent(from, "offer_shown", { variant: "footer" });
 
   return safeSend(from,
     `🧠 *Diagnóstico Aivora*\n` +
@@ -700,7 +840,8 @@ async function handleAnswer(from, upper, state) {
     `━━━━━━━━━━━━━━━━━━\n` +
     `¿Esto resolvió el problema?\n\n` +
     `✅ *FIXED* — Sí, resuelto\n` +
-    `❌ *NO* — Sigue fallando`
+    `❌ *NO* — Sigue fallando` +
+    (OFFER_ENABLED ? OFFER_FOOTER : "")
   );
 }
 
@@ -748,11 +889,17 @@ async function handleFixDescription(from, text, state) {
   });
 
   delete userState[from];
+  if (OFFER_ENABLED) logEvent(from, "offer_shown", { variant: "post_fix" });
 
   return safeSend(from,
     `✅ *¡Registrado, gracias!*\n\n` +
     `Cada caso confirmado hace a Aivora más preciso. 🧠\n\n` +
-    `Manda un nuevo código cuando lo necesites. ¡Éxito! 🔧`
+    `Manda un nuevo código cuando lo necesites. ¡Éxito! 🔧` +
+    (OFFER_ENABLED
+      ? `\n\n━━━━━━━━━━━━━━━━━━\n` +
+        `🚀 Por cierto: estamos armando *Aivora Pro* — 10 diagnósticos prioritarios con seguimiento personal por ${OFFER_PRICE} (lanzamiento).\n\n` +
+        `Manda *INFO* si quieres los detalles. Aivora normal sigue gratis. 😉`
+      : "")
   );
 }
 
@@ -778,4 +925,8 @@ async function safeSend(to, body) {
 // 🔹 START
 // ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Aivora V1 active on port ${PORT} — ${AVAILABLE_CODES.length} códigos activos`));
+app.listen(PORT, () => console.log(
+  `🚀 Aivora V1 active on port ${PORT} — ${AVAILABLE_CODES.length} códigos activos — ` +
+  `data: ${DATA_DIR} (${IS_PERSISTENT ? "PERSISTENTE ✅" : "efímero ⚠️"}) — ` +
+  `offer: ${OFFER_ENABLED ? "ON" : "OFF"}`
+));
