@@ -444,6 +444,66 @@ const diagnostics = {
         return { cause: "Señal PNP incorrecta afectando los cambios", action: `La ECU no sabe la posición real de la palanca. Verificar la señal del switch con escáner en cada posición.${versaNote}` };
       return { cause: "Falla eléctrica del circuito PNP", action: `Revisar conector y cableado del switch. Reemplazar si el circuito está bien pero el código persiste ($600–1,200 MXN).${versaNote}` };
     }
+  },
+
+  P2138: {
+    name: "Correlación de sensores del pedal del acelerador (APP D/E)",
+    questions: [
+      { key: "changed", ask: "1️⃣ ¿El *sensor del pedal* ya se cambió? (SI / NO)" },
+      { key: "relearn", ask: "2️⃣ ¿Después del cambio hicieron el *reaprendizaje del cuerpo de aceleración*? (SI / NO / NO SÉ)" },
+      { key: "jerk", ask: "3️⃣ ¿Sigue el *tirón intermitente* aunque ya haya mejorado? (SI / NO)" }
+    ],
+    logic: (a, v) => {
+      const isVersa = v.model?.toUpperCase().includes("VERSA");
+      const versaNote = isVersa ? " En la Versa este código casi siempre involucra el pedal (dos sensores internos que deben coincidir) o el cuerpo de aceleración electrónico." : "";
+      if (a.changed === "SI" && (a.relearn === "NO" || a.relearn === "NO SE" || a.relearn === "NO SÉ"))
+        return { cause: "Falta reaprendizaje tras el cambio de pedal", action: `Hacer reaprendizaje (gratis): llave ON sin arrancar 3 seg, apagar, repetir 3 veces, arrancar y ralentí 10 min sin tocar el acelerador. Muchas veces el tirón residual se va con esto.${versaNote}` };
+      if (a.changed === "SI" && a.jerk === "SI")
+        return { cause: "Cuerpo de aceleración (TPS) sucio o desgastado", action: `Con el pedal ya bien, si sigue el tirón el sensor del lado del cuerpo de aceleración es lo siguiente a revisar. Limpiar y volver a hacer reaprendizaje; si persiste, evaluar cambio del cuerpo de aceleración.${versaNote}` };
+      if (a.changed === "NO")
+        return { cause: "Sensor del pedal (APP) con correlación fuera de rango", action: `Las dos señales internas del pedal no coinciden entre sí. Reemplazar el sensor del pedal — no se repara, es una sola pieza.${versaNote}` };
+      return { cause: "Conector del pedal mal asentado tras la reparación", action: `Revisar que el conector nuevo quede firme y sin corrosión. Un mal contacto tras la instalación puede dar tirones intermitentes.${versaNote}` };
+    }
+  },
+
+  P2119: {
+    name: "Rango/rendimiento del actuador de control del acelerador",
+    questions: [
+      { key: "cleaned", ask: "1️⃣ ¿El código apareció después de una *limpieza del cuerpo de aceleración*? (SI / NO)" },
+      { key: "relearn", ask: "2️⃣ ¿Ya se hizo el *reaprendizaje* después de esa limpieza? (SI / NO / NO SÉ)" },
+      { key: "stall", ask: "3️⃣ ¿El motor *se apaga o casi se apaga* al frenar o bajar a velocidad casi cero? (SI / NO)" }
+    ],
+    logic: (a, v) => {
+      const isVersa = v.model?.toUpperCase().includes("VERSA");
+      const versaNote = isVersa ? " En la Versa este código suele salir junto con P0123/P0223/P2138 — todos del mismo sistema de acelerador electrónico." : "";
+      if (a.cleaned === "SI" && (a.relearn === "NO" || a.relearn === "NO SE" || a.relearn === "NO SÉ"))
+        return { cause: "Reaprendizaje faltante o incompleto tras la limpieza", action: `Hacer reaprendizaje completo (gratis): llave ON sin arrancar 3 seg, apagar, repetir 3 veces, arrancar y ralentí 10 min sin tocar acelerador ni A/C. Si "funcionó unos días y volvió", casi siempre es que el reaprendizaje no quedó completo.${versaNote}` };
+      if (a.stall === "SI" && a.relearn === "SI")
+        return { cause: "Actuador del cuerpo de aceleración con desgaste o carbón acumulado de nuevo", action: `Con reaprendizaje ya confirmado y el motor apagándose cerca de velocidad cero, el actuador puede estar fallando para sostener la posición mínima. Revisar mecánicamente el actuador; si el problema regresa seguido, evaluar reemplazo del cuerpo de aceleración.${versaNote}` };
+      if (a.cleaned === "NO")
+        return { cause: "Conector o cableado del actuador con falla intermitente", action: `Revisar el conector del cuerpo de aceleración por corrosión o pines flojos, y el arnés por algún roce.${versaNote}` };
+      return { cause: "Actuador fuera de rango — verificar con escáner", action: `Comparar el ángulo comandado vs el real del cuerpo de aceleración. Si hay diferencia, el actuador no está respondiendo correctamente.${versaNote}` };
+    }
+  },
+
+  P0223: {
+    name: "Circuito del sensor de posición del pedal 'B' — señal alta",
+    questions: [
+      { key: "movedConn", ask: "1️⃣ ¿Se *movió o revisó el conector del pedal* recientemente (limpieza, reparación)? (SI / NO)" },
+      { key: "combo", ask: "2️⃣ ¿Aparece *junto con otros códigos* de acelerador (P0123, P2119, etc.)? (SI / NO)" },
+      { key: "stall", ask: "3️⃣ ¿El motor *titubea o se apaga* al soltar el acelerador por completo? (SI / NO)" }
+    ],
+    logic: (a, v) => {
+      const isVersa = v.model?.toUpperCase().includes("VERSA");
+      const versaNote = isVersa ? " En la Versa, P0223 junto con P0123/P2119 casi siempre apunta a lo mismo: reaprendizaje pendiente o conector suelto tras un servicio reciente." : "";
+      if (a.movedConn === "SI")
+        return { cause: "Conector del pedal mal asentado", action: `Desconectar, revisar por corrosión o pines doblados, y volver a conectar firme. Repetir el reaprendizaje después.${versaNote}` };
+      if (a.combo === "SI")
+        return { cause: "Falla de correlación del sistema completo de acelerador", action: `Cuando salen varios códigos de este sistema juntos, lo más común es reaprendizaje faltante tras un servicio reciente, no una pieza dañada. Hacer reaprendizaje completo antes de cambiar nada.${versaNote}` };
+      if (a.stall === "SI")
+        return { cause: "Sensor B fuera de rango cerca de acelerador en cero", action: `La señal se sale de rango justo donde el sistema necesita más precisión. Si el reaprendizaje no lo resuelve, reemplazar el sensor del pedal (es una sola pieza, no se repara individualmente).${versaNote}` };
+      return { cause: "Sensor B del pedal defectuoso", action: `Verificar voltaje del sensor B con escáner. Si está fuera de especificación, reemplazar el conjunto del pedal.${versaNote}` };
+    }
   }
 
 };
@@ -518,14 +578,22 @@ const KNOWN_MODELS = {
 };
 
 function parseInput(text) {
-  const code = text.toUpperCase().match(/P[0-9]{4}/)?.[0];
-  if (!code) return null;
+  // Detecta TODOS los códigos P#### del mensaje, no solo el primero.
+  // Si el usuario manda varios (ej. P0203\nP0202\nP0204\nP0201), antes
+  // solo se procesaba el primero y el resto se perdía sin dejar rastro.
+  const codes = [...new Set((text.toUpperCase().match(/P[0-9]{4}/g) || []))];
+  if (!codes.length) return null;
+
+  // Prioriza un código que sí tengamos en base, para no responder
+  // "no está en mi base" cuando otro código del mismo mensaje sí aplica.
+  const code = codes.find(c => diagnostics[c]) || codes[0];
+  const extraCodes = codes.filter(c => c !== code);
 
   if (text.includes("|")) {
     const parts = text.split("|").map(x => x.trim());
     const [make = "", model = "", year = "", , mileageRaw = "0"] = parts;
     return {
-      code,
+      code, extraCodes,
       vehicle: {
         make, model,
         year: (year.match(/\d{4}/) || [""])[0],
@@ -534,7 +602,7 @@ function parseInput(text) {
     };
   }
 
-  const cleaned = text.replace(/P[0-9]{4}/i, " ");
+  const cleaned = text.replace(/P[0-9]{4}/gi, " ");
   const upper = cleaned.toUpperCase();
 
   let make = "";
@@ -549,7 +617,7 @@ function parseInput(text) {
     ? nums.sort((a, b) => b.length - a.length || Number(b) - Number(a))[0]
     : "0";
 
-  return { code, vehicle: { make, model, year, mileage } };
+  return { code, extraCodes, vehicle: { make, model, year, mileage } };
 }
 
 function normalizeAnswer(text) {
@@ -738,7 +806,7 @@ async function handleInteraction(message) {
     if (parsed) {
       const hasNewVehicle = parsed.vehicle.make || parsed.vehicle.model || parsed.vehicle.year;
       const vehicle = hasNewVehicle ? parsed.vehicle : (state.vehicle || parsed.vehicle);
-      return startDiagnostic(from, parsed.code, vehicle, text);
+      return startDiagnostic(from, parsed.code, vehicle, text, parsed.extraCodes);
     }
 
     if (state.stage === "awaiting_feedback") return handleFeedback(from, upper, state);
@@ -779,20 +847,28 @@ function welcomeMessage() {
 // ─────────────────────────────────────────────────────────────
 // 🔹 START DIAGNOSTIC
 // ─────────────────────────────────────────────────────────────
-async function startDiagnostic(from, code, vehicle, rawText) {
+async function startDiagnostic(from, code, vehicle, rawText, extraCodes = []) {
   const diag = diagnostics[code];
+
+  // Códigos adicionales del mismo mensaje que no tenemos en base →
+  // se registran para el backlog en vez de perderse silenciosamente.
+  extraCodes.filter(c => !diagnostics[c]).forEach(c => logMissedCode(from, c, rawText));
+  const extraNote = extraCodes.length
+    ? `\n\n📋 También vi *${extraCodes.join(", ")}* en tu mensaje — mándamelo(s) uno por uno cuando terminemos este para diagnosticarlos también.`
+    : "";
 
   if (!diag) {
     logMissedCode(from, code, rawText);
     return safeSend(from,
       `⚠️ El código *${code}* todavía no está en mi base.\n\n` +
       `Ya lo registré para agregarlo pronto 🙌\n\n` +
-      `Tengo ${AVAILABLE_CODES.length} códigos de Versa listos. Manda uno como P0300, P0420, P0744, P2135, P0705 o P0302 para un diagnóstico al instante.`
+      `Tengo ${AVAILABLE_CODES.length} códigos de Versa listos. Manda uno como P0300, P0420, P0744, P2135, P0705 o P0302 para un diagnóstico al instante.` +
+      extraNote
     );
   }
 
   userState[from] = { stage: "questioning", code, vehicle, step: 0, answers: {}, lastTs: Date.now() };
-  logEvent(from, "diag_start", { code });
+  logEvent(from, "diag_start", { code, extraCodes });
 
   const hasVehicle = vehicle.make && vehicle.make.length > 0;
   const label = hasVehicle
@@ -803,7 +879,8 @@ async function startDiagnostic(from, code, vehicle, rawText) {
     `🔍 *${code} — ${diag.name}*\n` +
     label +
     `\nVamos a identificar la causa 👇\n\n` +
-    diag.questions[0].ask
+    diag.questions[0].ask +
+    extraNote
   );
 }
 
