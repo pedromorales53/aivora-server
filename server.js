@@ -1192,4 +1192,4 @@ app.listen(PORT, () => console.log(
   `🚀 Aivora V1 active on port ${PORT} — ${AVAILABLE_CODES.length} códigos activos — ` +
   `data: ${DATA_DIR} (${IS_PERSISTENT ? "PERSISTENTE ✅" : "efímero ⚠️"}) — ` +
   `offer: ${OFFER_ENABLED ? "ON" : "OFF"}`
-));
+));
