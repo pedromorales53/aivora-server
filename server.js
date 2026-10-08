@@ -14,6 +14,16 @@ app.use(express.urlencoded({ extended: true }));
 
 const { VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID } = process.env;
 
+// /stats y /logs exponen teléfonos de usuarios (datos personales).
+// Usa un token propio y largo (STATS_TOKEN) en vez del verify token de Meta.
+// Si no está definido, cae al VERIFY_TOKEN para no romper nada.
+const STATS_TOKEN = process.env.STATS_TOKEN || VERIFY_TOKEN;
+
+// 📸 Lectura de fotos del escáner (opcional). Con ANTHROPIC_API_KEY definida,
+// Aivora lee la foto y extrae los códigos. Sin la llave, pide escribir el código.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const VISION_MODEL      = process.env.VISION_MODEL || "claude-haiku-5-5";
+
 // ─────────────────────────────────────────────────────────────
 // 📁 DATA DIR — PERSISTENCIA
 // Si existe la variable DATA_DIR (ej. /data con un Volume de
@@ -39,7 +49,7 @@ function appendLine(p, obj) {
 }
 const logResolvedCase = (entry)            => appendLine(LOG_PATH, entry);
 const logMissedCode   = (from, code, raw)  => appendLine(MISS_PATH, { from, code, rawText: raw });
-const logInteraction  = (from, text)       => appendLine(INTERACTIONS_PATH, { from, text });
+const logInteraction  = (from, text, type = "text", extra = {}) => appendLine(INTERACTIONS_PATH, { from, text, type, ...extra });
 const logSymptom      = (from, tag, raw)   => appendLine(SYMPTOM_PATH, { from, tag, rawText: raw });
 const logEvent        = (from, event, meta = {}) => appendLine(EVENTS_PATH, { from, event, ...meta });
 const logInterest     = (from, level, raw) => appendLine(INTEREST_PATH, { from, level, rawText: raw });
@@ -51,7 +61,8 @@ const logInterest     = (from, level, raw) => appendLine(INTEREST_PATH, { from, 
 // Edita precio/copy aquí; OFFER_ENABLED=false lo apaga sin deploy
 // de código (via variable de entorno en Railway).
 // ─────────────────────────────────────────────────────────────
-const OFFER_ENABLED = (process.env.OFFER_ENABLED || "true").toLowerCase() !== "false";
+// Apagado por defecto: 14+ impresiones orgánicas, 0 interés real. OFFER_ENABLED=true lo reactiva.
+const OFFER_ENABLED = (process.env.OFFER_ENABLED || "false").toLowerCase() === "true";
 const OFFER_PRICE   = process.env.OFFER_PRICE || "$99 MXN";
 
 const OFFER_FOOTER = `\n\n💡 ¿Quieres diagnósticos *prioritarios* con seguimiento personal? Manda *INFO*`;
@@ -466,6 +477,24 @@ const diagnostics = {
     }
   },
 
+  P0603: {
+    name: "Error de memoria activa (KAM) del módulo de control",
+    questions: [
+      { key: "event", ask: "1️⃣ ¿Hace poco se *desconectó o descargó la batería*, le pasaron corriente o prestaste la tuya? (SI / NO)" },
+      { key: "terminals", ask: "2️⃣ ¿Las *terminales de la batería* están bien apretadas y sin sulfato (polvo blanco/verde)? (SI / NO / NO SÉ)" },
+      { key: "recurring", ask: "3️⃣ ¿El código *regresa* aunque ya lo hayan borrado? (SI / NO)" }
+    ],
+    logic: (a) => {
+      if (a.event === "SI" && a.recurring !== "SI")
+        return { cause: "Pérdida de memoria por corte o bajón de voltaje", action: "Es lo más común y no es grave. Borra el código y maneja normal unos días: la computadora vuelve a aprender sola. Si quieres estar tranquilo, pide una prueba de batería con carga (no solo voltaje)." };
+      if (a.terminals !== "SI")
+        return { cause: "Terminal floja o sulfatada", action: "Limpia las terminales con bicarbonato y agua, apriétalas bien y borra el código. Un mal contacto hace que la computadora pierda memoria de forma intermitente." };
+      if (a.recurring === "SI")
+        return { cause: "Batería débil, alternador o alimentación de la ECU", action: "Mide voltaje: 12.4–12.6V apagado y 13.8–14.5V encendido. Si eso está bien, revisar fusible y tierra de la ECU. Solo al final pensar en la ECU." };
+      return { cause: "Evento eléctrico aislado", action: "Borra el código y vigílalo. Si no regresa en una semana, no hay que hacer nada más." };
+    }
+  },
+
   P2119: {
     name: "Rango/rendimiento del actuador de control del acelerador",
     questions: [
@@ -577,11 +606,31 @@ const KNOWN_MODELS = {
   FRONTIER: "Frontier", KICKS: "Kicks", ALTIMA: "Altima", XTRAIL: "X-Trail"
 };
 
-function parseInput(text) {
+// "Po300" / "p 0300" / "PO420" → P0300 / P0420 (errores de dedo reales en los logs)
+function normalizeCodes(text) {
+  return text.toUpperCase()
+    .replace(/\bP\s*O(?=\d{3}\b)/g, "P0")
+    .replace(/\bP\s+(\d{4})\b/g, "P$1");
+}
+
+// Códigos de carrocería/chasis/red (B/C/U): aún no los diagnosticamos,
+// pero los reconocemos para no contestar con la bienvenida genérica.
+function findNonPCodes(text) {
+  return [...new Set((text.toUpperCase().match(/\b[BCU][0-9]{4}/g) || []))];
+}
+
+const MODEL_MAKE = {
+  Versa: "Nissan", Tsuru: "Nissan", Sentra: "Nissan", March: "Nissan", Tiida: "Nissan",
+  NP300: "Nissan", Frontier: "Nissan", Kicks: "Nissan", Altima: "Nissan", "X-Trail": "Nissan",
+  Aveo: "Chevrolet", Spark: "Chevrolet", Jetta: "Volkswagen", Gol: "Volkswagen", Vento: "Volkswagen", Figo: "Ford"
+};
+
+function parseInput(rawText) {
   // Detecta TODOS los códigos P#### del mensaje, no solo el primero.
   // Si el usuario manda varios (ej. P0203\nP0202\nP0204\nP0201), antes
   // solo se procesaba el primero y el resto se perdía sin dejar rastro.
-  const codes = [...new Set((text.toUpperCase().match(/P[0-9]{4}/g) || []))];
+  const text = normalizeCodes(rawText);
+  const codes = [...new Set((text.match(/P[0-9]{4}/g) || []))];
   if (!codes.length) return null;
 
   // Prioriza un código que sí tengamos en base, para no responder
@@ -602,13 +651,15 @@ function parseInput(text) {
     };
   }
 
-  const cleaned = text.replace(/P[0-9]{4}/gi, " ");
+  const cleaned = text.replace(/[PBCU][0-9]{4}(-[0-9]{2})?/gi, " ");
   const upper = cleaned.toUpperCase();
 
   let make = "";
   for (const key in KNOWN_MAKES) { if (upper.includes(key)) { make = KNOWN_MAKES[key]; break; } }
   let model = "";
   for (const key in KNOWN_MODELS) { if (upper.includes(key)) { model = KNOWN_MODELS[key]; break; } }
+  // "versa 2019" sin marca → Nissan (así se escribe en los grupos)
+  if (!make && MODEL_MAKE[model]) make = MODEL_MAKE[model];
 
   const year = (cleaned.match(/\b(199\d|20[0-2]\d)\b/) || [""])[0];
   const nums = (cleaned.match(/\d[\d,]{2,}/g) || [])
@@ -646,7 +697,7 @@ app.get("/", (req, res) => res.status(200).send("Aivora Engine: Online ✅"));
 
 // /stats?token=VERIFY_TOKEN → tablero de decisión completo
 app.get("/stats", (req, res) => {
-  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  if (!STATS_TOKEN || req.query.token !== STATS_TOKEN) return res.sendStatus(403);
 
   const interactions = readJsonl(INTERACTIONS_PATH);
   const events       = readJsonl(EVENTS_PATH);
@@ -663,6 +714,16 @@ app.get("/stats", (req, res) => {
   });
   const uniqueUsers = Object.keys(byUser).length;
   const returning = Object.values(byUser).filter(days => days.size >= 2).length;
+
+  // Puerta de entrada: ¿cuántos usuarios llegaron a mandar un código?
+  // (La fuga más grande en los logs: gente que dice "Hola" y se va.)
+  const sentCode = new Set();
+  interactions.forEach(i => {
+    const t = normalizeCodes(i.text || "");
+    if (/P[0-9]{4}/.test(t) || findNonPCodes(t).length || (i.codesFromImage && i.codesFromImage.length)) sentCode.add(i.from);
+  });
+  const nonText = interactions.filter(i => (i.type && i.type !== "text") || i.text === "");
+  const imagesWithCodes = interactions.filter(i => i.codesFromImage && i.codesFromImage.length).length;
 
   // Actividad por día (para ver tendencia, no solo acumulado)
   const daily = {};
@@ -702,6 +763,14 @@ app.get("/stats", (req, res) => {
       returning_users: returning,
       daily_messages: daily
     },
+    front_door: {
+      users_sent_code: sentCode.size,
+      users_never_sent_code: uniqueUsers - sentCode.size,
+      code_rate: uniqueUsers ? Math.round((sentCode.size / uniqueUsers) * 100) + "%" : "0%",
+      non_text_messages: nonText.length,
+      images_read_ok: imagesWithCodes,
+      photo_reading: ANTHROPIC_API_KEY ? "ON" : "OFF (falta ANTHROPIC_API_KEY)"
+    },
     funnel: {
       diagnostics_started: starts.length,
       results_delivered: results.length,
@@ -736,7 +805,7 @@ const LOG_FILES = {
   interest: INTEREST_PATH
 };
 app.get("/logs", (req, res) => {
-  if (req.query.token !== VERIFY_TOKEN) return res.sendStatus(403);
+  if (!STATS_TOKEN || req.query.token !== STATS_TOKEN) return res.sendStatus(403);
   const file = LOG_FILES[req.query.file];
   if (!file) return res.status(400).json({ error: "file debe ser: " + Object.keys(LOG_FILES).join(", ") });
   const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
@@ -769,10 +838,8 @@ app.post("/webhook", (req, res) => {
 async function handleInteraction(message) {
   try {
     const from = message.from;
-    const text = (message.text?.body || "").trim();
-    const upper = text.toUpperCase();
-
-    logInteraction(from, text);
+    const type = message.type || (message.text ? "text" : "unknown");
+    let text = (message.text?.body || message.image?.caption || "").trim();
 
     // Sesión abandonada hace 6+ horas → empezar limpio (conserva el vehículo)
     let state = userState[from] || {};
@@ -783,7 +850,57 @@ async function handleInteraction(message) {
     state.lastTs = Date.now();
     userState[from] = state;
 
-    if (["RESET", "REINICIAR", "NUEVO", "MENU"].some(c => upper.includes(c))) {
+    // ── 📸 Fotos y otros mensajes que no son texto ──────────────
+    // En los grupos la gente manda FOTO del escáner, no texto. Antes una
+    // foto llegaba como texto vacío y recibía la bienvenida genérica.
+    if (type !== "text") {
+      if (type === "image") {
+        // WhatsApp entrega varias fotos casi al mismo tiempo (un usuario mandó 7).
+        // Solo la primera arranca diagnóstico; las demás solo registran códigos.
+        const recentBurst = state.lastImageTs && Date.now() - state.lastImageTs < 90 * 1000;
+        state.lastImageTs = Date.now();
+        const read = await readImageCodes(message.image?.id);
+        logInteraction(from, text, type, { codesFromImage: read?.codes || [] });
+
+        const cur = userState[from] || state;
+        const burstAlreadyStarted = cur.burstCodesTs && Date.now() - cur.burstCodesTs < 90 * 1000;
+
+        if (read && read.codes.length) {
+          if (burstAlreadyStarted) {
+            read.codes.filter(c => !diagnostics[c]).forEach(c => logMissedCode(from, c, "[foto]"));
+            return;
+          }
+          cur.burstCodesTs = Date.now(); // se marca ANTES de cualquier await
+          const pCodes = read.codes.filter(c => c.startsWith("P"));
+          if (pCodes.length) read.codes.filter(c => !c.startsWith("P")).forEach(c => logMissedCode(from, c, "[foto]"));
+          await safeSend(from, `📸 Leí en tu foto: *${read.codes.join(", ")}*${read.vehicle ? ` (${read.vehicle})` : ""}`);
+          if (!pCodes.length) return replyNonPCodes(from, read.codes, "[foto]");
+          text = `${read.vehicle} ${text} ${pCodes.join(" ")}`.trim();
+          state = userState[from] || cur;
+          // sigue al flujo normal de texto con los códigos leídos
+        } else {
+          if (recentBurst || burstAlreadyStarted) return; // no contestar 7 veces a 7 fotos
+          return safeSend(from,
+            `📸 Recibí tu foto, pero no alcancé a leer el código.\n\n` +
+            `Escríbemelo tal cual aparece en el escáner (empieza con *P*, ej: *P0420*) y tu modelo y año.`);
+        }
+      } else {
+        logInteraction(from, text, type);
+        if (state.lastNonTextTs && Date.now() - state.lastNonTextTs < 90 * 1000) return;
+        state.lastNonTextTs = Date.now();
+        const what = type === "audio" ? "audios" : "ese tipo de mensaje";
+        return safeSend(from,
+          `🙏 Todavía no puedo escuchar ${what}.\n\n` +
+          `Escríbeme el código que te marcó el escáner (ej: *P0420*)` +
+          (ANTHROPIC_API_KEY ? ` o mándame *foto* de la pantalla del escáner.` : `.`));
+      }
+    } else {
+      logInteraction(from, text, type);
+    }
+
+    const upper = text.toUpperCase();
+
+    if (["RESET", "REINICIAR", "NUEVO", "MENU", "MENÚ"].some(c => upper.includes(c))) {
       delete userState[from];
       return safeSend(from, welcomeMessage());
     }
@@ -813,18 +930,31 @@ async function handleInteraction(message) {
     if (state.stage === "awaiting_fix_description") return handleFixDescription(from, text, state);
     if (state.stage === "questioning") return handleAnswer(from, upper, state);
 
+    // Códigos B/C/U (carrocería, chasis, red): respuesta honesta en vez de bienvenida
+    const nonP = findNonPCodes(text);
+    if (nonP.length) return replyNonPCodes(from, nonP, text);
+
     // ¿Describe un síntoma conocido sin código?
     const symptom = detectSymptom(text);
     if (symptom) {
       logSymptom(from, symptom.tag, text);
       return safeSend(from,
         `🔧 Por lo que describes:\n\n${symptom.hint}\n\n` +
-        `Para un diagnóstico exacto necesito el *código de falla*. Escanéalo gratis en AutoZone y mándamelo (ej: P0420) junto con marca, modelo y año.\n\n` +
-        `_Ej: Nissan Versa 2016 P0420 90000_`
+        `Para un diagnóstico exacto necesito el *código de falla* (ej: P0420). En AutoZone te lo escanean gratis.`
       );
     }
 
-    // Nada reconocible → bienvenida
+    // Texto libre que no reconocemos: guardarlo como demanda (qué piden de verdad)
+    if (text.length >= 12) logSymptom(from, "unmatched", text);
+
+    // Ya le dimos la bienvenida en esta sesión → empujón corto, no repetir el bloque
+    if (state.welcomed) {
+      return safeSend(from,
+        `Para ayudarte necesito el *código* que te marcó el escáner (ej: *P0420*)` +
+        (ANTHROPIC_API_KEY ? ` o una *foto* de la pantalla. 📸` : `.`) +
+        `\n\n¿No tienes código? Dime qué hace el carro: ¿no acelera, tiembla, se apaga, se calienta?`);
+    }
+    state.welcomed = true;
     return safeSend(from, welcomeMessage());
 
   } catch (err) {
@@ -832,16 +962,67 @@ async function handleInteraction(message) {
   }
 }
 
+// Bienvenida: UNA sola pregunta. Antes pedía "Marca Modelo Año Código Km"
+// y 16 de 26 usuarios dijeron "Hola" y nunca mandaron nada más.
 function welcomeMessage() {
   return (
-    `👋 Bienvenido a *Aivora Diagnostics* 🔧\n\n` +
-    `Mándame la falla de tu carro así de fácil:\n\n` +
-    `*Marca Modelo Año Código Kilometraje*\n` +
-    `_Ej: Nissan Versa 2016 P0300 84000_\n\n` +
-    `O si solo tienes el código, mándalo solito:\n` +
-    `_Ej: P0300_\n\n` +
-    `Escribe *MENU* en cualquier momento para reiniciar.`
+    `👋 ¡Hola! Soy *Aivora* 🔧 Te ayudo a entender la falla de tu carro, gratis.\n\n` +
+    `¿Qué código te marcó el escáner? Escríbelo tal cual (ej: *P0420*)` +
+    (ANTHROPIC_API_KEY ? ` o mándame *foto* de la pantalla del escáner. 📸` : `.`) +
+    `\n\n¿No tienes el código? En AutoZone te lo escanean gratis, o cuéntame qué hace el carro.`
   );
+}
+
+async function replyNonPCodes(from, codes, raw) {
+  codes.forEach(c => logMissedCode(from, c, raw));
+  const kinds = { B: "carrocería (bolsas de aire, seguros, luces)", C: "chasis (ABS, frenos, dirección)", U: "comunicación entre módulos" };
+  const desc = [...new Set(codes.map(c => kinds[c[0]]))].join(" y ");
+  return safeSend(from,
+    `📋 *${codes.join(", ")}* ${codes.length > 1 ? "son códigos" : "es un código"} de ${desc}.\n\n` +
+    `Por ahora Aivora diagnostica códigos de *motor y transmisión* (los que empiezan con *P*). Ya lo registré para agregarlo. 🙌\n\n` +
+    `Si el escáner también te marcó algún código P, mándamelo y lo vemos.`);
+}
+
+// ─────────────────────────────────────────────────────────────
+// 📸 LECTURA DE FOTOS DEL ESCÁNER (requiere ANTHROPIC_API_KEY)
+// Descarga la imagen de WhatsApp y le pide al modelo los códigos.
+// Devuelve { codes: [...], vehicle: "" } o null si falla / no hay llave.
+// ─────────────────────────────────────────────────────────────
+async function readImageCodes(mediaId) {
+  if (!ANTHROPIC_API_KEY || !mediaId) return null;
+  try {
+    const auth = { Authorization: `Bearer ${WHATSAPP_TOKEN}` };
+    const meta = await axios.get(`https://graph.facebook.com/v25.0/${mediaId}`, { headers: auth, timeout: 8000 });
+    const img = await axios.get(meta.data.url, { headers: auth, responseType: "arraybuffer", timeout: 15000 });
+    const mediaType = (meta.data.mime_type || "image/jpeg").split(";")[0];
+    const data = Buffer.from(img.data).toString("base64");
+
+    const r = await axios.post("https://api.anthropic.com/v1/messages", {
+      model: VISION_MODEL,
+      max_tokens: 200,
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mediaType, data } },
+        { type: "text", text:
+          "Esta foto es de un escáner OBD o de un reporte de diagnóstico de auto. " +
+          "Extrae SOLO los códigos de falla (formato P0000, B0000, C0000 o U0000) y, si aparecen, marca, modelo y año del vehículo. " +
+          'Responde únicamente JSON: {"codes":["P0420"],"vehicle":"Nissan Versa 2016"}. ' +
+          'Si no hay códigos legibles responde {"codes":[],"vehicle":""}.' }
+      ] }]
+    }, {
+      headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      timeout: 30000
+    });
+
+    const out = (r.data.content || []).map(c => c.text || "").join("");
+    const json = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
+    const codes = [...new Set((json.codes || [])
+      .map(c => String(c).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5))
+      .filter(c => /^[PBCU][0-9]{4}$/.test(c)))];
+    return { codes, vehicle: String(json.vehicle || "").slice(0, 60) };
+  } catch (e) {
+    console.error("📸 vision error:", e.response?.data || e.message);
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -867,7 +1048,12 @@ async function startDiagnostic(from, code, vehicle, rawText, extraCodes = []) {
     );
   }
 
-  userState[from] = { stage: "questioning", code, vehicle, step: 0, answers: {}, lastTs: Date.now() };
+  const prev = userState[from] || {};
+  userState[from] = {
+    stage: "questioning", code, vehicle, step: 0, answers: {}, lastTs: Date.now(),
+    // se conservan para no repetir bienvenida ni reiniciar con ráfagas de fotos
+    welcomed: prev.welcomed, lastImageTs: prev.lastImageTs, burstCodesTs: prev.burstCodesTs
+  };
   logEvent(from, "diag_start", { code, extraCodes });
 
   const hasVehicle = vehicle.make && vehicle.make.length > 0;
