@@ -769,7 +769,8 @@ app.get("/stats", (req, res) => {
       code_rate: uniqueUsers ? Math.round((sentCode.size / uniqueUsers) * 100) + "%" : "0%",
       non_text_messages: nonText.length,
       images_read_ok: imagesWithCodes,
-      photo_reading: ANTHROPIC_API_KEY ? "ON" : "OFF (falta ANTHROPIC_API_KEY)"
+      photo_reading: ANTHROPIC_API_KEY ? "ON" : "OFF (falta ANTHROPIC_API_KEY)",
+      photo_last_error: visionHealth.lastError
     },
     funnel: {
       diagnostics_started: starts.length,
@@ -880,9 +881,13 @@ async function handleInteraction(message) {
           // sigue al flujo normal de texto con los códigos leídos
         } else {
           if (recentBurst || burstAlreadyStarted) return; // no contestar 7 veces a 7 fotos
-          return safeSend(from,
-            `📸 Recibí tu foto, pero no alcancé a leer el código.\n\n` +
-            `Escríbemelo tal cual aparece en el escáner (empieza con *P*, ej: *P0420*) y tu modelo y año.`);
+          // Sin ANTHROPIC_API_KEY la lectura de fotos está apagada: no decir
+          // "no alcancé a leer" (suena a falla), sino pedir el código directo.
+          return safeSend(from, ANTHROPIC_API_KEY
+            ? `📸 Recibí tu foto, pero no alcancé a leer el código.\n\n` +
+              `Escríbemelo tal cual aparece en el escáner (empieza con *P*, ej: *P0420*) y tu modelo y año.`
+            : `📸 ¡Gracias por la foto! Todavía no leo imágenes.\n\n` +
+              `Escríbeme el código que aparece (empieza con *P*, ej: *P0420*) y tu modelo y año, y te digo qué es.`);
         }
       } else {
         logInteraction(from, text, type);
@@ -988,6 +993,7 @@ async function replyNonPCodes(from, codes, raw) {
 // Descarga la imagen de WhatsApp y le pide al modelo los códigos.
 // Devuelve { codes: [...], vehicle: "" } o null si falla / no hay llave.
 // ─────────────────────────────────────────────────────────────
+const visionHealth = { lastError: null };
 async function readImageCodes(mediaId) {
   if (!ANTHROPIC_API_KEY || !mediaId) return null;
   try {
@@ -1021,6 +1027,7 @@ async function readImageCodes(mediaId) {
     return { codes, vehicle: String(json.vehicle || "").slice(0, 60) };
   } catch (e) {
     console.error("📸 vision error:", e.response?.data || e.message);
+    visionHealth.lastError = { message: e.response?.data?.error?.message || e.message, ts: new Date().toISOString() };
     return null;
   }
 }
@@ -1192,4 +1199,4 @@ app.listen(PORT, () => console.log(
   `🚀 Aivora V1 active on port ${PORT} — ${AVAILABLE_CODES.length} códigos activos — ` +
   `data: ${DATA_DIR} (${IS_PERSISTENT ? "PERSISTENTE ✅" : "efímero ⚠️"}) — ` +
   `offer: ${OFFER_ENABLED ? "ON" : "OFF"}`
-));
+));
